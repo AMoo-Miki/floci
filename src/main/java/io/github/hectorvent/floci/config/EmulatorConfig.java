@@ -570,6 +570,46 @@ public interface EmulatorConfig {
 
         @WithDefault("false")
         boolean seedDeployerPrincipal();
+
+        WebIdentityConfig webIdentity();
+
+        /**
+         * Opt-in cryptographic validation of web-identity tokens presented to
+         * {@code sts:AssumeRoleWithWebIdentity}. When disabled (default), any non-blank
+         * token is accepted and the response claims are stubbed — the pre-existing
+         * behaviour. When enabled, the JWT signature is verified against a statically
+         * configured issuer JWKS (no network egress), {@code iss}/{@code aud}/{@code exp}/
+         * {@code nbf} are checked, the real {@code sub} is decoded, and the role's
+         * trust-policy {@code Condition} (e.g. {@code <issuer>:sub}/{@code <issuer>:aud})
+         * is evaluated against the decoded claims before credentials are minted.
+         */
+        interface WebIdentityConfig {
+            @WithDefault("false")
+            boolean enabled();
+
+            /** Allowed clock skew (seconds) when checking {@code exp}/{@code nbf}/{@code iat}. */
+            @WithDefault("60")
+            long clockSkewSeconds();
+
+            /**
+             * Statically registered OIDC issuers and their signing keys. Each provider
+             * supplies a JWKS document via a file ({@code jwks-path}). Configuring multiple
+             * providers is cleaner in YAML than via environment variables.
+             */
+            @WithDefault("")
+            List<WebIdentityProvider> providers();
+
+            interface WebIdentityProvider {
+                /** Token {@code iss} this entry validates, e.g. {@code https://token.actions.githubusercontent.com}. */
+                String issuer();
+
+                /** When set, the token {@code aud} must contain this value. When absent, audience is not enforced at STS. */
+                Optional<String> audience();
+
+                /** Filesystem path to a standard JWKS document ({@code {"keys":[...]}}). */
+                Optional<String> jwksPath();
+            }
+        }
     }
 
     interface MskServiceConfig {

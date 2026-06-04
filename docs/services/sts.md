@@ -19,6 +19,63 @@
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_STS_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_IAM_WEB_IDENTITY_ENABLED` | `false` | Validate web-identity tokens and trust-policy conditions on `sts:AssumeRoleWithWebIdentity` (see below) |
+| `FLOCI_SERVICES_IAM_WEB_IDENTITY_CLOCK_SKEW_SECONDS` | `60` | Allowed clock skew when checking `exp`/`nbf`/`iat` |
+
+## Web-identity token validation
+
+By default (`web-identity.enabled = false`), `AssumeRoleWithWebIdentity` accepts any non-blank
+token and returns stubbed claims (`Provider=accounts.google.com`,
+`SubjectFromWebIdentityToken=web-identity-subject`, `Audience=sts.amazonaws.com`). This keeps
+zero-config local development frictionless but does not exercise the trust boundary (who is
+allowed to assume the role).
+
+When enabled, Floci validates the web-identity JWT entirely offline against statically configured
+issuer keys — no network egress to the OIDC provider:
+
+1. Verifies the RS256 signature against the issuer's configured JWKS, preferring the key whose
+   `kid` matches the token header and falling back to any of that issuer's configured keys. Only
+   RS256 signing keys with a 2048–8192-bit modulus are accepted.
+2. Checks `iss` (must be a registered issuer); requires `exp` and checks it — a token that omits
+   `exp` or carries a non-numeric `exp` is rejected — and checks `nbf`/`iat` when present, all
+   within the configured skew; checks `aud` only when the provider configures an expected audience.
+3. Decodes the real `sub` and returns the real `iss`/`sub`/`aud` in the response.
+4. Binds the role to the token's issuer and evaluates its trust policy before minting credentials:
+   a statement applies only when its `Principal.Federated` names the OIDC provider for the token's
+   `iss`, and its `Condition` matches the decoded claims. Supported condition keys are
+   `<issuer>:sub` and `<issuer>:aud` (the issuer with its scheme stripped, matching AWS naming);
+   `<issuer>:aud` is matched against every audience the token carries. Supported operators are
+   `StringEquals`, `StringEqualsIgnoreCase`, `StringLike` and their negations (`StringLike` is
+   case-sensitive, matching AWS); other operators and the `ForAnyValue:`/`ForAllValues:`
+   qualifiers fail closed.
+
+On failure, Floci returns the AWS-equivalent error: `ExpiredTokenException` (expired token),
+`InvalidIdentityToken` (malformed/unverifiable token, unknown issuer, audience mismatch), or
+`AccessDenied` (the trust-policy `Condition` did not match the token claims).
+
+Issuers and their signing keys are registered statically (cleaner in YAML than via environment
+variables). Each provider points at a JWKS document via a file path:
+
+```yaml
+floci:
+  services:
+    iam:
+      web-identity:
+        enabled: true
+        clock-skew-seconds: 60
+        providers:
+          - issuer: https://token.actions.githubusercontent.com
+            audience: sts.amazonaws.com          # optional; enforced only when set
+            jwks-path: /etc/floci/github-jwks.json
+          - issuer: https://accounts.google.com
+            jwks-path: /etc/floci/google-jwks.json
+```
+
+Only RS256 keys are supported (covers Google, GitHub Actions, Cognito, CircleCI, and OCI). The
+OIDC provider registry (`CreateOpenIDConnectProvider`) is not modelled; instead the role's
+`Principal.Federated` is matched directly against the token's issuer host (its
+`oidc-provider/<host>` segment must equal the `iss` host), and the trust boundary is then
+exercised through the `Condition` keys above.
 
 ## Examples
 

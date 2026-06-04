@@ -8,7 +8,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -312,80 +311,8 @@ public class IamPolicyEvaluator {
     }
 
     private boolean evaluateSingleCondition(String operator, String ctxValue, String condValue) {
-        return switch (operator) {
-            case "StringEquals"              -> ctxValue.equals(condValue);
-            case "StringNotEquals"           -> !ctxValue.equals(condValue);
-            case "StringEqualsIgnoreCase"    -> ctxValue.equalsIgnoreCase(condValue);
-            case "StringNotEqualsIgnoreCase" -> !ctxValue.equalsIgnoreCase(condValue);
-            case "StringLike"                -> globMatches(condValue, ctxValue);
-            case "StringNotLike"             -> !globMatches(condValue, ctxValue);
-            case "ArnEquals", "ArnLike"      -> globMatches(condValue, ctxValue);
-            case "ArnNotEquals", "ArnNotLike"-> !globMatches(condValue, ctxValue);
-            case "Bool"                      -> Boolean.parseBoolean(condValue) == Boolean.parseBoolean(ctxValue);
-            case "NumericEquals"             -> compareNumeric(ctxValue, condValue) == 0;
-            case "NumericNotEquals"          -> compareNumeric(ctxValue, condValue) != 0;
-            case "NumericLessThan"           -> compareNumeric(ctxValue, condValue) < 0;
-            case "NumericLessThanEquals"     -> compareNumeric(ctxValue, condValue) <= 0;
-            case "NumericGreaterThan"        -> compareNumeric(ctxValue, condValue) > 0;
-            case "NumericGreaterThanEquals"  -> compareNumeric(ctxValue, condValue) >= 0;
-            case "DateEquals"                -> compareDates(ctxValue, condValue) == 0;
-            case "DateNotEquals"             -> compareDates(ctxValue, condValue) != 0;
-            case "DateLessThan"              -> compareDates(ctxValue, condValue) < 0;
-            case "DateLessThanEquals"        -> compareDates(ctxValue, condValue) <= 0;
-            case "DateGreaterThan"           -> compareDates(ctxValue, condValue) > 0;
-            case "DateGreaterThanEquals"     -> compareDates(ctxValue, condValue) >= 0;
-            case "IpAddress"                 -> matchesIpAddress(condValue, ctxValue);
-            case "NotIpAddress"              -> !matchesIpAddress(condValue, ctxValue);
-            default -> {
-                LOG.warnv("Unsupported condition operator: {0} — treating as no-match", operator);
-                yield false;
-            }
-        };
-    }
-
-    private int compareNumeric(String ctxValue, String condValue) {
-        try {
-            return Double.compare(Double.parseDouble(ctxValue), Double.parseDouble(condValue));
-        } catch (NumberFormatException e) {
-            return 0;
-        }
-    }
-
-    private int compareDates(String ctxValue, String condValue) {
-        try {
-            return Instant.parse(ctxValue).compareTo(Instant.parse(condValue));
-        } catch (Exception e) {
-            return 0;
-        }
-    }
-
-    private boolean matchesIpAddress(String condValue, String ctxValue) {
-        if (condValue.contains("/")) {
-            return matchesCidr(condValue, ctxValue);
-        }
-        return condValue.equals(ctxValue);
-    }
-
-    private boolean matchesCidr(String cidr, String ip) {
-        try {
-            String[] parts = cidr.split("/");
-            int prefix = Integer.parseInt(parts[1]);
-            long cidrAddr = ipToLong(parts[0]);
-            long ipAddr = ipToLong(ip);
-            long mask = prefix == 0 ? 0L : (0xFFFFFFFFL << (32 - prefix)) & 0xFFFFFFFFL;
-            return (cidrAddr & mask) == (ipAddr & mask);
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    private long ipToLong(String ip) {
-        String[] octets = ip.split("\\.");
-        long result = 0;
-        for (String octet : octets) {
-            result = (result << 8) | Integer.parseInt(octet);
-        }
-        return result;
+        return IamConditionEngine.evaluateOperator(operator, ctxValue, condValue,
+                IamPolicyEvaluator::globMatches);
     }
 
     // -----------------------------------------------------------------------
@@ -452,14 +379,9 @@ public class IamPolicyEvaluator {
 
     private List<PolicyStatement> parseStatements(String document) throws Exception {
         JsonNode root = objectMapper.readTree(document);
-        JsonNode stmtNode = root.path("Statement");
         List<PolicyStatement> result = new ArrayList<>();
-        if (stmtNode.isArray()) {
-            for (JsonNode s : stmtNode) {
-                result.add(parseStatement(s));
-            }
-        } else if (stmtNode.isObject()) {
-            result.add(parseStatement(stmtNode));
+        for (JsonNode s : IamConditionEngine.statementNodes(root)) {
+            result.add(parseStatement(s));
         }
         return result;
     }
@@ -495,17 +417,6 @@ public class IamPolicyEvaluator {
     }
 
     private List<String> nodeToList(JsonNode node) {
-        List<String> list = new ArrayList<>();
-        if (node == null) {
-            return list;
-        }
-        if (node.isTextual()) {
-            list.add(node.asText());
-        } else if (node.isArray()) {
-            for (JsonNode item : node) {
-                list.add(item.asText());
-            }
-        }
-        return list;
+        return IamConditionEngine.nodeToList(node);
     }
 }

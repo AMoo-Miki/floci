@@ -17,7 +17,10 @@ public class IamRole {
     private String roleName;
     private String path;
     private String arn;
-    private String assumeRolePolicyDocument;
+    // volatile: UpdateAssumeRolePolicy mutates this in place on the already-published role, while
+    // AssumeRoleWithWebIdentity reads it on the credential-minting path; volatile guarantees the
+    // assume thread observes the latest complete document rather than a stale pre-update value.
+    private volatile String assumeRolePolicyDocument;
     private String description;
     private int maxSessionDuration = 3600;
     private Instant createDate;

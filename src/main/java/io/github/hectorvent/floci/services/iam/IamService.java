@@ -331,6 +331,11 @@ public class IamService {
                         "The role with name " + roleName + " cannot be found.", 404));
     }
 
+    /** Non-throwing role lookup used by trust-policy evaluation. */
+    public Optional<IamRole> findRole(String roleName) {
+        return roles.get(roleName);
+    }
+
     public void deleteRole(String roleName) {
         IamRole role = getRole(roleName);
         if (!role.getAttachedPolicyArns().isEmpty() || !role.getInlinePolicies().isEmpty()) {

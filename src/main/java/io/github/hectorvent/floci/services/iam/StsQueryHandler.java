@@ -1,12 +1,17 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryController;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.AccountResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
+import io.github.hectorvent.floci.services.iam.webidentity.WebIdentityClaims;
+import io.github.hectorvent.floci.services.iam.webidentity.WebIdentityTrustEvaluator;
+import io.github.hectorvent.floci.services.iam.webidentity.WebIdentityTokenValidator;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Context;
@@ -18,6 +23,7 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Query-protocol handler for STS (Security Token Service) actions.
@@ -33,15 +39,26 @@ public class StsQueryHandler {
     private final IamService iamService;
     private final AccountResolver accountResolver;
     private final RegionResolver regionResolver;
+    private final EmulatorConfig config;
+    private final WebIdentityTokenValidator webIdentityValidator;
+    private final WebIdentityTrustEvaluator webIdentityTrustEvaluator;
+    /** Ensures the "validation disabled" notice is logged once, not per request. */
+    private final AtomicBoolean webIdentityStubWarned = new AtomicBoolean(false);
 
     @Context
     HttpHeaders headers;
 
     @Inject
-    public StsQueryHandler(IamService iamService, AccountResolver accountResolver, RegionResolver regionResolver) {
+    public StsQueryHandler(IamService iamService, AccountResolver accountResolver, RegionResolver regionResolver,
+                           EmulatorConfig config,
+                           WebIdentityTokenValidator webIdentityValidator,
+                           WebIdentityTrustEvaluator webIdentityTrustEvaluator) {
         this.iamService = iamService;
         this.accountResolver = accountResolver;
         this.regionResolver = regionResolver;
+        this.config = config;
+        this.webIdentityValidator = webIdentityValidator;
+        this.webIdentityTrustEvaluator = webIdentityTrustEvaluator;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params) {
@@ -79,7 +96,7 @@ public class StsQueryHandler {
                 : "UnknownRole";
         String accountId = AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId());
         String assumedRoleArn = AwsArnUtils.Arn.of("sts", "", accountId, "assumed-role/" + roleName + "/" + sessionName).toString();
-        String assumedRoleId = "AROA" + randomId(16) + ":" + sessionName;
+        String assumedRoleId = "AROA" + randomId(17) + ":" + sessionName;
 
         // Register session so IAM enforcement can resolve the role's policies and so that
         // RDS/ElastiCache IAM token validation can find the temporary secret key.
@@ -131,7 +148,37 @@ public class StsQueryHandler {
         String roleArn = getParam(params, "RoleArn");
         String sessionName = getParam(params, "RoleSessionName");
         String providerId = getParam(params, "ProviderId");
+        String webIdentityToken = getParam(params, "WebIdentityToken");
         int durationSeconds = getIntParam(params, "DurationSeconds", 3600);
+
+        // Response claims default to the stubbed values (legacy behaviour). When
+        // web-identity validation is enabled, they are replaced by the verified token claims.
+        String provider = providerId != null && !providerId.isBlank() ? providerId : "accounts.google.com";
+        String subject = "web-identity-subject";
+        String audience = "sts.amazonaws.com";
+
+        if (config.services().iam().webIdentity().enabled()) {
+            WebIdentityClaims claims;
+            try {
+                claims = webIdentityValidator.validate(webIdentityToken);
+            } catch (AwsException e) {
+                LOG.debugv("Web-identity validation rejected: code={0}", e.getErrorCode());
+                return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.STS, e.getHttpStatus());
+            }
+            if (webIdentityTrustEvaluator.evaluate(roleArn, claims) == WebIdentityTrustEvaluator.Decision.DENY) {
+                return AwsQueryResponse.error("AccessDenied",
+                        "Not authorized to perform sts:AssumeRoleWithWebIdentity for role " + roleArn,
+                        AwsNamespaces.STS, 403);
+            }
+            provider = claims.issuer();
+            subject = claims.subject();
+            // Reflect the token's actual audience; omit <Audience> when the token carries none
+            // rather than fabricating the stub default on the validated path.
+            audience = claims.audiences().isEmpty() ? null : claims.audiences().getFirst();
+        } else if (webIdentityStubWarned.compareAndSet(false, true)) {
+            LOG.info("web-identity validation disabled; accepting AssumeRoleWithWebIdentity tokens "
+                    + "unverified with stubbed claims (set floci.services.iam.web-identity.enabled=true to validate)");
+        }
 
         String accessKeyId = "ASIA" + randomId(16);
         String secretKey = randomSecret(40);
@@ -141,8 +188,7 @@ public class StsQueryHandler {
         String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
         String accountId = AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId());
         String assumedRoleArn = AwsArnUtils.Arn.of("sts", "", accountId, "assumed-role/" + roleName + "/" + sessionName).toString();
-        String assumedRoleId = "AROA" + randomId(16) + ":" + sessionName;
-        String provider = providerId != null && !providerId.isBlank() ? providerId : "accounts.google.com";
+        String assumedRoleId = "AROA" + randomId(17) + ":" + sessionName;
 
         String sessionPolicy = getParam(params, "Policy");
         iamService.registerSession(accessKeyId, secretKey, roleArn, expiration, sessionPolicy);
@@ -155,8 +201,8 @@ public class StsQueryHandler {
                 .end("AssumedRoleUser")
                 .elem("PackedPolicySize", "0")
                 .elem("Provider", provider)
-                .elem("Audience", "sts.amazonaws.com")
-                .elem("SubjectFromWebIdentityToken", "web-identity-subject")
+                .elem("Audience", audience)
+                .elem("SubjectFromWebIdentityToken", subject)
                 .build();
         return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithWebIdentity", AwsNamespaces.STS, result)).build();
     }
@@ -178,7 +224,7 @@ public class StsQueryHandler {
         String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
         String accountId = AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId());
         String assumedRoleArn = AwsArnUtils.Arn.of("sts", "", accountId, "assumed-role/" + roleName + "/" + sessionName).toString();
-        String assumedRoleId = "AROA" + randomId(16) + ":" + sessionName;
+        String assumedRoleId = "AROA" + randomId(17) + ":" + sessionName;
 
         iamService.registerSession(accessKeyId, secretKey, roleArn, expiration, null);
 

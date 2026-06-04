@@ -193,6 +193,20 @@ floci:
       enabled: true
       enforcement-enabled: false
       seed-deployer-principal: false
+      web-identity:
+        # Opt-in cryptographic validation of sts:AssumeRoleWithWebIdentity tokens.
+        # When false (default), any non-blank web-identity token is accepted (stubbed claims).
+        # When true, the JWT signature is verified against a statically configured issuer
+        # JWKS (offline, no network), iss/aud/exp/nbf are checked, the real sub is decoded,
+        # and the role trust-policy Condition (<issuer>:sub / <issuer>:aud) is evaluated.
+        enabled: false                 # FLOCI_SERVICES_IAM_WEB_IDENTITY_ENABLED
+        clock-skew-seconds: 60
+        # providers:
+        #   - issuer: https://token.actions.githubusercontent.com
+        #     audience: sts.amazonaws.com          # optional; enforced only when set
+        #     jwks-path: /etc/floci/github-jwks.json
+        #   - issuer: https://accounts.google.com
+        #     jwks-path: /etc/floci/google-jwks.json
     msk:
       enabled: true
       mock: false

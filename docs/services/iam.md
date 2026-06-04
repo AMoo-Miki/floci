@@ -140,6 +140,12 @@ When a caller uses `sts:AssumeRole` the returned session credentials are registe
 1. The **role's** attached and inline policies.
 2. The **session policy** (if provided during `AssumeRole`), acting as an intersection filter.
 
+This covers the **permission boundary** (what the assumed role may do). The **trust boundary**
+(who may assume the role) is enforced separately for web-identity federation: enabling
+`FLOCI_SERVICES_IAM_WEB_IDENTITY_ENABLED` makes `sts:AssumeRoleWithWebIdentity` verify the OIDC
+token and evaluate the role's trust-policy `Condition` (`<issuer>:sub` / `<issuer>:aud`) before
+issuing credentials. See [STS](sts.md#web-identity-token-validation) for details.
+
 ### Example — minimal enforcement setup
 
 ```bash
@@ -171,6 +177,8 @@ AWS_ACCESS_KEY_ID=$AKID AWS_SECRET_ACCESS_KEY=$SECRET \
 | `FLOCI_SERVICES_IAM_ENABLED` | `true` | Enable or disable the service |
 | `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` | `false` | Enforce IAM policies on all inbound requests |
 | `FLOCI_SERVICES_IAM_SEED_DEPLOYER_PRINCIPAL` | `false` | Seed the optional `floci-deployer` user and `floci` / `floci` access key |
+| `FLOCI_SERVICES_IAM_WEB_IDENTITY_ENABLED` | `false` | Validate web-identity tokens and trust-policy conditions on `sts:AssumeRoleWithWebIdentity` ([details](sts.md#web-identity-token-validation)) |
+| `FLOCI_SERVICES_IAM_WEB_IDENTITY_CLOCK_SKEW_SECONDS` | `60` | Allowed clock skew when checking `exp`/`nbf`/`iat` |
 
 ## Examples
 
