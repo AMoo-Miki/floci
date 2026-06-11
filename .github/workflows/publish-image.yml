@@ -1,0 +1,197 @@
+name: Publish image (GHCR)
+
+# Manual mirror of release.yml that publishes to GHCR instead of Docker Hub.
+# Builds native (amd64 + arm64) Docker images and pushes a single versioned
+# tag derived from the project version in pom.xml.
+#
+# MANUAL ONLY: never runs on push/tag/schedule. Trigger from the Actions tab
+# or `gh workflow run publish-image.yml`, choosing the branch/ref at dispatch.
+#
+# Fails fast if the version is already published (bump pom.xml to release).
+#
+# Published tag (uses the built-in GITHUB_TOKEN, no extra secrets):
+#   ghcr.io/<owner>/floci:<pom.xml version>
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Preflight: resolve version and refuse to overwrite an existing tag ────
+  preflight:
+    name: Check version is unpublished
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      ref: ${{ steps.img.outputs.ref }}
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Extract version
+        id: version
+        run: echo "version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)" >> "$GITHUB_OUTPUT"
+
+      - name: Compute lowercase image reference
+        id: img
+        run: echo "ref=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/floci" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail if version already published
+        run: |
+          REF="${{ steps.img.outputs.ref }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          if docker buildx imagetools inspect "$REF:$VERSION" >/dev/null 2>&1; then
+            echo "::error::$REF:$VERSION already exists in GHCR; bump the version in pom.xml before publishing."
+            exit 1
+          fi
+          echo "$REF:$VERSION is not published yet; proceeding."
+
+  # ── Build native artifact — amd64 ────────────────────────────────────────
+  build-native-amd64:
+    name: Build native artifact (amd64)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: graalvm/setup-graalvm@bef4b0e916c7dd079bf60fb95d49139f67e32c5f # v1
+        with:
+          java-version: '25'
+          distribution: 'mandrel'
+          cache: maven
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build native executable
+        run: mvn clean package -Dnative -DskipTests -B -Dquarkus.native.additional-build-args-append="-march=x86-64-v2"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-amd64
+          path: |
+            target/*-runner
+            target/*.properties
+            target/*.so
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ── Build native artifact — arm64 ────────────────────────────────────────
+  build-native-arm64:
+    name: Build native artifact (arm64)
+    needs: preflight
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: graalvm/setup-graalvm@bef4b0e916c7dd079bf60fb95d49139f67e32c5f # v1
+        with:
+          java-version: '25'
+          distribution: 'mandrel'
+          cache: maven
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build native executable
+        run: mvn clean package -Dnative -DskipTests -B
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-arm64
+          path: |
+            target/*-runner
+            target/*.properties
+            target/*.so
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ── Push native Docker image ─────────────────────────────────────────────
+  push-native:
+    name: Push native Docker image to GHCR
+    needs: [preflight, build-native-amd64, build-native-arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Set created timestamp
+        id: created
+        run: echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Set SOURCE_DATE_EPOCH
+        id: source_date
+        run: echo "epoch=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: native-amd64
+          path: native/amd64/
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: native-arm64
+          path: native/arm64/
+
+      - name: Make binaries executable
+        run: chmod +x native/amd64/*-runner native/arm64/*-runner
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-check version is still unpublished
+        run: |
+          REF="${{ needs.preflight.outputs.ref }}"
+          VERSION="${{ needs.preflight.outputs.version }}"
+          if docker buildx imagetools inspect "$REF:$VERSION" >/dev/null 2>&1; then
+            echo "::error::$REF:$VERSION was published while this build ran; aborting to avoid overwrite."
+            exit 1
+          fi
+
+      - name: Build and push native multi-arch image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.source_date.outputs.epoch }}
+        with:
+          context: .
+          file: docker/Dockerfile.native-package
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ needs.preflight.outputs.ref }}:${{ needs.preflight.outputs.version }}
+          build-args: |
+            VERSION=${{ needs.preflight.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.preflight.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.created.outputs.created }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
