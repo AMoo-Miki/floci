@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.JwkRsaKeys;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -20,6 +22,7 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Verifies web-identity JWTs against statically-configured issuer JWKS.
@@ -59,22 +62,79 @@ public class WebIdentityTokenValidator {
     private final long clockSkewSeconds;
     private final Clock clock;
     private final ObjectMapper mapper;
+    private final boolean validationEnabled;
+    private final List<String> configuredIssuers;
 
     @Inject
     public WebIdentityTokenValidator(EmulatorConfig config, ObjectMapper mapper) {
         this(buildFromConfig(config, mapper),
                 config.services().iam().webIdentity().clockSkewSeconds(),
                 Clock.systemUTC(),
-                mapper);
+                mapper,
+                config.services().iam().webIdentity().enabled(),
+                configuredIssuers(config));
     }
 
-    /** Test constructor: inject pre-built issuer keys directly. */
+    /** Test constructor: inject pre-built issuer keys directly (validation treated as disabled). */
     WebIdentityTokenValidator(Map<String, IssuerKeys> byIssuer, long clockSkewSeconds,
                               Clock clock, ObjectMapper mapper) {
+        this(byIssuer, clockSkewSeconds, clock, mapper, false, List.of());
+    }
+
+    private WebIdentityTokenValidator(Map<String, IssuerKeys> byIssuer, long clockSkewSeconds,
+                                      Clock clock, ObjectMapper mapper,
+                                      boolean validationEnabled, List<String> configuredIssuers) {
         this.byIssuer = Map.copyOf(byIssuer);
         this.clockSkewSeconds = clockSkewSeconds;
         this.clock = clock;
         this.mapper = mapper;
+        this.validationEnabled = validationEnabled;
+        this.configuredIssuers = List.copyOf(configuredIssuers);
+    }
+
+    private static List<String> configuredIssuers(EmulatorConfig config) {
+        return config.services().iam().webIdentity().providers().stream()
+                .map(EmulatorConfig.IamServiceConfig.WebIdentityConfig.WebIdentityProvider::issuer)
+                .filter(Objects::nonNull)
+                .toList();
+    }
+
+    /**
+     * Eagerly loads the issuer JWKS at startup (rather than lazily on the first
+     * {@code AssumeRoleWithWebIdentity}) and fails closed when validation is enabled but a
+     * configured provider could not be loaded.
+     *
+     * <p>Observing {@link StartupEvent} forces this {@code @ApplicationScoped} bean to be
+     * constructed during startup — the same technique {@code EmulatorLifecycle} uses — so the
+     * keys are loaded before the HTTP server serves any request. This removes the cold-start
+     * window where the first assume triggered (and blocked on) lazy construction, and makes
+     * readiness deterministic: once Floci reports ready ({@code GET /_floci/init}), the
+     * validator is built and every configured issuer is loaded.
+     *
+     * <p>Fail-closed is the correct default on a credential-minting boundary: silently running
+     * with an unloaded provider would reject that issuer's tokens at runtime with the generic
+     * {@code InvalidIdentityToken}, which is far harder to diagnose than a clear boot failure.
+     */
+    void onStartup(@Observes StartupEvent ignored) {
+        if (!validationEnabled) {
+            return;
+        }
+        if (configuredIssuers.isEmpty()) {
+            throw new IllegalStateException(
+                    "floci.services.iam.web-identity.enabled=true but no providers are configured; "
+                    + "AssumeRoleWithWebIdentity would reject every token. Configure at least one provider "
+                    + "(issuer + jwks-path) or set web-identity.enabled=false.");
+        }
+        List<String> missing = configuredIssuers.stream()
+                .filter(issuer -> !byIssuer.containsKey(issuer))
+                .toList();
+        if (!missing.isEmpty()) {
+            throw new IllegalStateException(
+                    "Web-identity validation is enabled but no usable JWKS loaded for issuer(s): " + missing
+                    + ". Verify each provider's jwks-path is readable and contains usable RS256 keys. "
+                    + "(failing closed so credentials are never minted against tokens that cannot be verified)");
+        }
+        LOG.infov("Web-identity validation ready: {0} issuer(s) loaded", byIssuer.size());
     }
 
     /**

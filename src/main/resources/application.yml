@@ -199,6 +199,10 @@ floci:
         # When true, the JWT signature is verified against a statically configured issuer
         # JWKS (offline, no network), iss/aud/exp/nbf are checked, the real sub is decoded,
         # and the role trust-policy Condition (<issuer>:sub / <issuer>:aud) is evaluated.
+        # When enabled, the configured JWKS are loaded eagerly at startup (not lazily on the
+        # first assume) and startup fails closed if any provider has no usable RS256 key — so
+        # once Floci reports ready (GET /_floci/init) the validator is built and every issuer
+        # is loaded. Gate dependents on /_floci/init readiness, not the always-200 /_floci/health.
         enabled: false                 # FLOCI_SERVICES_IAM_WEB_IDENTITY_ENABLED
         clock-skew-seconds: 60
         # providers:

@@ -77,6 +77,25 @@ OIDC provider registry (`CreateOpenIDConnectProvider`) is not modelled; instead 
 `oidc-provider/<host>` segment must equal the `iss` host), and the trust boundary is then
 exercised through the `Condition` keys above.
 
+### Startup and readiness
+
+When validation is enabled, the configured JWKS are loaded **eagerly at startup** rather than
+lazily on the first `AssumeRoleWithWebIdentity`, and startup **fails closed**: if a configured
+provider has no readable JWKS or no usable RS256 key, Floci logs the offending issuer(s) and
+aborts boot instead of starting in a state that would reject those tokens at runtime. This
+removes the cold-start window where the first assume blocked on (or raced) lazy key loading.
+
+Because loading happens during startup, readiness is deterministic: once Floci reports ready via
+`GET /_floci/init` (`completed.ready = true`), the validator is built and every configured issuer
+is loaded. Gate dependent services on `/_floci/init` readiness — not `/_floci/health`, which is a
+liveness/info endpoint that returns `200` as soon as the process is up, before init completes.
+
+Note that web-identity validation is the *trust* boundary only. Whether the assumed role itself
+exists is a separate concern: IAM roles are created by your own seeding (`CreateRole` /
+`PutRolePolicy`) and are stored per account, so an `AssumeRoleWithWebIdentity` for a role that has
+not been created yet (or was created under a different account) returns `AccessDenied` from the
+trust evaluation — order your role seeding before the first assume.
+
 ## Examples
 
 ```bash
